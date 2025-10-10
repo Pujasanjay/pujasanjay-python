@@ -1,0 +1,452 @@
+from google.colab import files
+
+# Upload your 3 files
+uploaded = files.upload()
+
+
+import os
+
+print("Files in current directory:")
+print(os.listdir())
+
+
+# Imports and plotting configuration
+import sys
+import os
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+
+sns.set(style="whitegrid", palette="muted", font_scale=1.1)
+plt.rcParams["figure.figsize"] = (10, 5)
+
+def abort(msg):
+    print(f"\n ABORT: {msg}")
+    sys.exit(1)
+
+print(" Libraries loaded\n")
+
+
+# ---------- Step 1: Load files with robust handling and QC ----------
+print("STEP 1: Loading files and showing initial QC...\n")
+
+# File paths
+sample_path_tsv = "Sample_Information.tsv"
+expr_path_xlsx = "Gene_Expression_Data.xlsx"
+geneinfo_path_csv = "Gene_Information.csv"
+
+# 1.1 Load sample info (TSV with malformed header)
+try:
+    if not os.path.exists(sample_path_tsv):
+        abort(f"{sample_path_tsv} not found in working directory ({os.getcwd()})")
+
+    # Skip first line (malformed header) and parse as TSV
+    sample_info = pd.read_csv(sample_path_tsv, sep="\t", header=None, skiprows=1, engine="python")
+    if sample_info.shape[1] < 3:
+        abort(f"Expected at least 3 columns in {sample_path_tsv}, found {sample_info.shape[1]}")
+    sample_info = sample_info.iloc[:, :3]  # keep first 3 columns if extra present
+    sample_info.columns = ["sample_id", "phenotype", "patient"]
+    sample_info["sample_id"] = sample_info["sample_id"].astype(str).str.strip()
+    sample_info["phenotype"] = sample_info["phenotype"].astype(str).str.strip().str.lower()
+    print("Sample information loaded:")
+    print(sample_info.head(), "\n")
+    print("Sample info shape:", sample_info.shape)
+    print("Phenotype counts:\n", sample_info["phenotype"].value_counts(), "\n")
+except pd.errors.ParserError as e:
+    abort(f"Parsing error reading {sample_path_tsv}: {e}")
+except Exception as e:
+    abort(f"Error loading sample information: {e}")
+
+
+
+# 1.2 Load gene expression Excel
+try:
+    if not os.path.exists(expr_path_xlsx):
+        abort(f"{expr_path_xlsx} not found in working directory ({os.getcwd()})")
+
+    gene_expr = pd.read_excel(expr_path_xlsx, index_col=0, engine="openpyxl")
+    # Ensure index is string and strip whitespace
+    gene_expr.index = gene_expr.index.astype(str).str.strip()
+    print("\nGene expression data loaded:")
+    print("Shape (probes x samples):", gene_expr.shape)
+    print("First 5 probes (index) and first 6 sample columns preview:")
+    display_cols = gene_expr.columns[:6].tolist()
+    print(gene_expr.loc[gene_expr.index[:5], display_cols])
+except Exception as e:
+    abort(f"Error loading gene expression data: {e}")
+
+
+
+# 1.3 Load gene info CSV
+try:
+    if not os.path.exists(geneinfo_path_csv):
+        abort(f"{geneinfo_path_csv} not found in working directory ({os.getcwd()})")
+
+    gene_info = pd.read_csv(geneinfo_path_csv)
+    # Basic expected columns: at least 'Probe_ID'; check for 'chromosome' if needed later
+    if "Probe_ID" not in gene_info.columns:
+        abort("Gene info must contain a 'Probe_ID' column")
+    print("\nGene information loaded:")
+    print("Shape:", gene_info.shape)
+    print("First 5 rows:")
+    print(gene_info.head(), "\n")
+except Exception as e:
+    abort(f"Error loading gene information: {e}")
+
+
+# ---------- Step 2: Map samples -> phenotype and rename columns ----------
+print("STEP 2: Mapping sample IDs to phenotype and renaming expression columns\n")
+
+# Create mapping dictionary
+sample_map = sample_info.set_index("sample_id")["phenotype"].to_dict()
+print("Sample -> phenotype mapping (first 10):")
+for i, (k, v) in enumerate(sample_map.items()):
+    print(f"  {k} -> {v}")
+    if i >= 9:
+        break
+print()
+
+# Sanity: check that at least one expression column is present in mapping
+expr_cols_set = set(gene_expr.columns.astype(str))
+mapped_cols = [c for c in gene_expr.columns if c in sample_map]
+unmapped_cols = [c for c in gene_expr.columns if c not in sample_map]
+
+print(f"Total expression columns: {len(gene_expr.columns)}")
+print(f"Columns matched to sample info: {len(mapped_cols)}")
+print(f"Columns NOT found in sample info (first 10): {unmapped_cols[:10]}\n")
+
+if len(mapped_cols) == 0:
+    abort("No expression column names matched sample IDs from Sample_Information.tsv. Check naming/whitespace.")
+
+# Build new column names preserving order, adding suffix to keep uniqueness
+phenotype_counts = {}
+new_col_names = []
+for col in gene_expr.columns:
+    col_str = str(col).strip()
+    pheno = sample_map.get(col_str, "unknown")
+    phenotype_counts.setdefault(pheno, 0)
+    phenotype_counts[pheno] += 1
+    new_name = f"{pheno}_{phenotype_counts[pheno]}"
+    new_col_names.append(new_name)
+
+gene_expr.columns = new_col_names
+print("Renamed expression columns (first 20):")
+print(gene_expr.columns[:20].tolist(), "\n")
+
+# QC: ensure uniqueness
+if gene_expr.columns.duplicated().any():
+    abort("Column renaming produced duplicate column names. Aborting.")
+
+
+
+# ---------- Step 3: Split into tumor and normal ----------
+print("STEP 3: Splitting expression matrix into tumor and normal\n")
+tumor_cols = [c for c in gene_expr.columns if str(c).startswith("tumor")]
+normal_cols = [c for c in gene_expr.columns if str(c).startswith("normal")]
+unknown_cols = [c for c in gene_expr.columns if (not str(c).startswith("tumor") and not str(c).startswith("normal"))]
+
+print("Tumor columns count:", len(tumor_cols))
+print("Normal columns count:", len(normal_cols))
+print("Unknown-labeled columns count:", len(unknown_cols))
+print("Examples - tumor:", tumor_cols[:5], " normal:", normal_cols[:5], "\n")
+
+if len(tumor_cols) == 0 or len(normal_cols) == 0:
+    abort("Need at least one tumor and one normal sample to proceed.")
+
+tumor_df = gene_expr[tumor_cols].copy()
+normal_df = gene_expr[normal_cols].copy()
+
+print("Tumor df shape:", tumor_df.shape)
+print("Normal df shape:", normal_df.shape, "\n")
+
+
+
+# ---------- Step 4: Compute average expression per probe ----------
+print("STEP 4: Computing average expression per probe for each group\n")
+tumor_avg = tumor_df.mean(axis=1)
+normal_avg = normal_df.mean(axis=1)
+
+print("Tumor average (first 8 probes):")
+print(tumor_avg.head(8).to_frame(name="tumor_avg"))
+print("\nNormal average (first 8 probes):")
+print(normal_avg.head(8).to_frame(name="normal_avg"), "\n")
+
+# QC: check distributions
+print("Summary statistics of averaged expression values (tumor):")
+print(tumor_avg.describe(), "\n")
+print("Summary statistics of averaged expression values (normal):")
+print(normal_avg.describe(), "\n")
+
+
+
+# ---------- Step 5: Compute fold-change and QC ----------
+print("STEP 5: Computing fold change = (Tumor - Normal) / Normal\n")
+# Avoid division by zero: mark Normal zeros
+zero_normals = (normal_avg == 0).sum()
+if zero_normals > 0:
+    print(f" {zero_normals} probes have normal average == 0. They will be set to NaN for fold change to avoid division by zero.")
+normal_avg_safe = normal_avg.replace({0: np.nan})
+fold_change = (tumor_avg - normal_avg_safe) / normal_avg_safe
+fold_change.name = "fold_change"
+
+# Show first values and check NaN/infs
+fc_preview = fold_change.head(10)
+print("Fold change preview (first 10):")
+print(fc_preview.to_frame(), "\n")
+
+n_nan = fold_change.isna().sum()
+n_inf = np.isinf(fold_change).sum()
+print(f"Fold change NaNs: {n_nan}, infinite values: {n_inf}\n")
+
+if n_nan > 0:
+    print("Sample of probes with NaN fold change (due to normal_avg==0 or missing):")
+    print(fold_change[fold_change.isna()].head(10).to_frame(), "\n")
+
+
+
+# ---------- Step 6: Merge fold change with gene_info and QC ----------
+print("STEP 6: Merging fold change with gene annotation information\n")
+# set index for gene_info
+gene_info = gene_info.copy()
+gene_info["Probe_ID"] = gene_info["Probe_ID"].astype(str).str.strip()
+gene_info.set_index("Probe_ID", inplace=True)
+
+# Align probes: find intersection
+probes_in_expr = set(fold_change.index.astype(str))
+probes_in_info = set(gene_info.index.astype(str))
+common_probes = sorted(probes_in_expr.intersection(probes_in_info))
+
+print(f"Probes in expression data: {len(probes_in_expr)}")
+print(f"Probes in gene info file: {len(probes_in_info)}")
+print(f"Common probes to merge: {len(common_probes)}\n")
+
+if len(common_probes) == 0:
+    abort("No matching probes between expression data and gene_info. Check probe identifiers.")
+
+merged = pd.concat([fold_change.loc[common_probes].to_frame(), gene_info.loc[common_probes]], axis=1, join="inner")
+print("Merged data shape:", merged.shape)
+print("Merged preview (first 8 rows):")
+print(merged.head(8), "\n")
+
+
+
+# ---------- Step 7: Filter DEGs with |fold_change| > 5 ----------
+print("STEP 7: Filtering DEGs with abs(fold_change) > 5\n")
+deg = merged[merged["fold_change"].abs() > 5].copy()
+print("DEG count:", len(deg))
+if len(deg) == 0:
+    print(" No DEGs found with absolute fold change > 5. Consider lowering threshold.")
+else:
+    print("DEG preview (first 8 rows):")
+    print(deg.head(8), "\n")
+
+# Add expression_trend column (Tumor if fc>0 else Normal)
+deg["expression_trend"] = np.where(deg["fold_change"] > 0, "Tumor", "Normal")
+print("DEG expression trend counts:")
+print(deg["expression_trend"].value_counts(), "\n")
+
+
+
+
+# ---------- Step 8: Exploratory plots and QC visualizations ----------
+print("STEP 8: Generating QC visualizations\n")
+
+# ---------- Replacement for STEP 8: Robust chromosome handling, QC and plotting ----------
+import re
+
+print("STEP 8 (improved): Attempting to use chromosome data for plotting\n")
+
+# 8.0: Show available gene_info columns for diagnosis
+print("Available columns in gene_info:", list(gene_info.columns))
+candidate_names = ["chromosome", "chrom", "chr", "Chromosome", "CHROM", "chromosome_name"]
+found_chr_col = None
+
+# 8.1: Look for obvious chromosome columns (case insensitive)
+for col in gene_info.columns:
+    if str(col).lower() in {"chromosome", "chrom", "chr", "chromosome_name", "chrom_name"}:
+        found_chr_col = col
+        break
+
+if found_chr_col:
+    print(f" Found chromosome column: '{found_chr_col}'")
+    # Ensure it's copied into deg if present
+    if found_chr_col not in deg.columns:
+        # deg index should be probe_id; try to map
+        try:
+            deg = deg.reset_index().merge(gene_info[[found_chr_col]].reset_index(), left_on="index", right_on="probe_id", how="left").set_index("index")
+            deg.index.name = None
+            # after merge, chromosome column name will be found_chr_col
+        except Exception as e:
+            print(f" Could not merge chromosome column into deg: {e}")
+else:
+    # 8.2: Try to extract chromosome from other plausible columns (e.g., location, loc, coord, position)
+    print(" No obvious chromosome column found. Trying to extract chromosome from location-like columns.")
+    loc_candidates = [c for c in gene_info.columns if any(kw in str(c).lower() for kw in ("loc", "pos", "coord", "location", "range", "chr"))]
+    print("Location-like candidates:", loc_candidates[:6])
+
+    extracted = False
+    for loc_col in loc_candidates:
+        sample_vals = gene_info[loc_col].astype(str).dropna().head(20).tolist()
+        # heuristic: check for patterns like "chr1:12345-67890" or "1:12345-67890" or "chrX"
+        pattern_present = any(re.search(r"(chr)?\s*[XYxy]|chr\d+|\b\d+\b[:\-]", s) for s in sample_vals)
+        if pattern_present:
+            print(f"Attempting extraction from column: {loc_col}")
+            def extract_chr(val):
+                if pd.isna(val):
+                    return np.nan
+                s = str(val)
+                # common patterns: 'chr1:123-456', '1:12345-67890', '1', 'chrX'
+                m = re.search(r"chr\s*([0-9XYM]+)", s, flags=re.IGNORECASE)
+                if m:
+                    return m.group(1).upper()
+                m2 = re.search(r"\b([0-9]{1,2}|X|Y|M)\b", s, flags=re.IGNORECASE)
+                if m2:
+                    return m2.group(1).upper()
+                return np.nan
+            try:
+                gene_info["__extracted_chr__"] = gene_info[loc_col].apply(extract_chr)
+                n_found = gene_info["__extracted_chr__"].notna().sum()
+                print(f"Extracted chromosome-like values for {n_found} rows from '{loc_col}'.")
+                if n_found > 0:
+                    # merge into deg
+                    try:
+                        gene_info_subset = gene_info[["__extracted_chr__"]].copy()
+                        gene_info_subset.index = gene_info.index  # ensure probe_id index
+                        # if gene_info currently indexed by probe_id (as earlier), good; else set index
+                        if gene_info_subset.index.name != "probe_id":
+                            gene_info_subset = gene_info_subset.reset_index().set_index("probe_id")
+                        deg = deg.reset_index().merge(gene_info_subset.reset_index(), left_on="index", right_on="probe_id", how="left").set_index("index")
+                        deg.index.name = None
+                        deg.rename(columns={"__extracted_chr__": "chromosome"}, inplace=True)
+                        extracted = True
+                        print(" Merged extracted chromosome values into deg as 'chromosome'.")
+                        break
+                    except Exception as e:
+                        print(f" Failed to merge extracted chromosomes into deg: {e}")
+            except Exception as e:
+                print(f" Extraction attempt failed for column {loc_col}: {e}")
+
+    if not extracted:
+        print(" Could not find or extract chromosome information from gene_info. Will skip chromosome-specific plots and report alternatives.\n")
+
+# 8.3: If chromosome info now exists in deg, create the chromosome plots (with QC prints)
+if "chromosome" in deg.columns and deg["chromosome"].notna().sum() > 0:
+    print("Proceeding to plot chromosome distributions. Sample of chromosome values and counts:")
+    print(deg["chromosome"].value_counts().head(20), "\n")
+
+    # Histogram / countplot
+    plt.figure(figsize=(12,5))
+    sns.countplot(data=deg.reset_index(), x="chromosome", order=sorted(deg["chromosome"].dropna().unique(), key=lambda x: (not x.isdigit(), x)))
+    plt.title("Distribution of DEGs by Chromosome")
+    plt.xlabel("Chromosome")
+    plt.ylabel("Number of DEGs")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+    # Stacked histogram by trend
+    plt.figure(figsize=(12,5))
+    sns.histplot(data=deg.reset_index(), x="chromosome", hue="expression_trend", multiple="stack")
+    plt.title("DEGs by Chromosome and Expression Trend")
+    plt.xlabel("Chromosome")
+    plt.ylabel("Count")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+else:
+    print("Skipping chromosome plots because deg has no usable 'chromosome' column.\n")
+    # Alternative: show DEGs by gene symbol if available
+    alt_cols = [c for c in deg.columns if any(k in str(c).lower() for k in ("gene", "symbol", "gene_name"))]
+    if alt_cols:
+        genecol = alt_cols[0]
+        print(f"As alternative visualization, plotting top genes by DEG count using '{genecol}' column.")
+        top_genes = deg[genecol].value_counts().head(20)
+        print("Top genes (counts):\n", top_genes)
+        plt.figure(figsize=(10,5))
+        sns.barplot(x=top_genes.values, y=top_genes.index)
+        plt.xlabel("DEG count")
+        plt.title("Top gene symbols among DEGs")
+        plt.tight_layout()
+        plt.show()
+    else:
+        print("No gene symbol column available to substitute. Consider adding chromosome or gene-name info to gene_info for richer plotting.\n")
+
+print("STEP 8 (improved) complete.\n")
+
+
+
+# 8.3 Bar chart percentages up/down in Tumor
+trend_counts_pct = deg["expression_trend"].value_counts(normalize=True) * 100
+if trend_counts_pct.empty:
+    print("No DEG trend data to plot.")
+else:
+    plt.figure()
+    sns.barplot(x=trend_counts_pct.index, y=trend_counts_pct.values)
+    plt.ylabel("Percentage of DEGs (%)")
+    plt.title("Percentage of DEGs Upregulated in Tumor vs Normal")
+    for i, v in enumerate(trend_counts_pct.values):
+        plt.text(i, v + 1, f"{v:.1f}%", ha="center")
+    plt.ylim(0, 100)
+    plt.tight_layout()
+    plt.show()
+
+
+
+# 8.4 Heatmap of raw expression data for top variable probes (use fold-change ranking or variance)
+print("\nHeatmap and clustermap preparatory QC:")
+# choose probes to show: if deg exists show DEGs top N else top variance probes
+if len(deg) >= 50:
+    probes_to_plot = deg.index[:50].tolist()
+    print(f"Plotting heatmap for top 50 DEGs (by list order).")
+else:
+    # fallback: top 50 probes by variance across all samples
+    var_ranked = gene_expr.var(axis=1).sort_values(ascending=False)
+    probes_to_plot = var_ranked.index[:50].tolist()
+    print(f"Not enough DEGs ({len(deg)}). Plotting top 50 most variable probes instead.")
+
+heat_df = gene_expr.loc[probes_to_plot]
+print("Heatmap matrix shape:", heat_df.shape)
+print("Heatmap matrix preview (first 6 rows, first 8 columns):")
+print(heat_df.iloc[:6, :8], "\n")
+
+# plot heatmap (standardized per gene for visualization)
+from sklearn.preprocessing import StandardScaler
+scaler = StandardScaler()
+scaled = pd.DataFrame(scaler.fit_transform(heat_df.values), index=heat_df.index, columns=heat_df.columns)
+
+plt.figure(figsize=(12,8))
+sns.heatmap(scaled, cmap="vlag", center=0, yticklabels=True, xticklabels=True, cbar_kws={'label':'Z-score'})
+plt.title("Heatmap (Z-scored) of selected probes")
+plt.xlabel("Samples")
+plt.ylabel("Probes")
+plt.tight_layout()
+plt.show()
+
+# clustermap
+sns.clustermap(scaled, cmap="vlag", metric="euclidean", method="average", figsize=(12,10))
+plt.suptitle("Clustermap of selected probes", y=1.02)
+plt.show()
+
+
+
+
+# ---------- Step 9: Final concise report ----------
+print("\nFINAL SUMMARY & QC METRICS")
+print("-------------------------")
+print("Sample info shape:", sample_info.shape)
+print("Expression matrix shape:", gene_expr.shape)
+print("Gene info shape:", gene_info.shape)
+print("Common probes used for analysis:", len(common_probes))
+print("DEGs (|FC|>5):", len(deg))
+if len(deg) > 0 and "chromosome" in deg.columns:
+    top_chr = deg["chromosome"].value_counts().head(3)
+    print("Top chromosomes with DEGs:\n", top_chr)
+if len(deg) > 0:
+    print("DEG trend distribution:\n", deg["expression_trend"].value_counts())
+
+print("\nAll steps completed. If you want the outputs saved to files (tables, figures) or the script adapted to different thresholds, tell me which ones and I'll update the code.")
+
+
